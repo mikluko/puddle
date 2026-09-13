@@ -1,3 +1,7 @@
+# Unreleased
+
+* Yield the releasing goroutine's P to a blocked acquirer after Release, Destroy and Hijack, so a released resource does not sit unused until the releaser blocks (Mikhail Lukianchenko)
+
 # 2.2.2 (September 10, 2024)
 
 * Add empty acquire time to stats (Maxim Ivanov)

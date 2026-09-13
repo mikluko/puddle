@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/bits"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,6 +143,8 @@ type Pool[T any] struct {
 	emptyAcquireCount    int64
 	emptyAcquireWaitTime time.Duration
 	canceledAcquireCount atomic.Int64
+	// waiting is the number of goroutines blocked in acquireSem.Acquire.
+	waiting atomic.Int64
 
 	resetCount int
 
@@ -358,7 +361,9 @@ func (p *Pool[T]) acquire(ctx context.Context) (*Resource[T], error) {
 	var waitedForLock bool
 	if !p.acquireSem.TryAcquire(1) {
 		waitedForLock = true
+		p.waiting.Add(1)
 		err := p.acquireSem.Acquire(ctx, 1)
+		p.waiting.Add(-1)
 		if err != nil {
 			p.canceledAcquireCount.Add(1)
 			return nil, err
@@ -671,6 +676,7 @@ func (p *Pool[T]) Reset() {
 
 // releaseAcquiredResource returns res to the the pool.
 func (p *Pool[T]) releaseAcquiredResource(res *Resource[T], lastUsedNano int64) {
+	defer p.yieldToWaiter()
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
@@ -690,6 +696,7 @@ func (p *Pool[T]) releaseAcquiredResource(res *Resource[T], lastUsedNano int64) 
 func (p *Pool[T]) destroyAcquiredResource(res *Resource[T]) {
 	p.destructResourceValue(res.value)
 
+	defer p.yieldToWaiter()
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
@@ -698,6 +705,7 @@ func (p *Pool[T]) destroyAcquiredResource(res *Resource[T]) {
 }
 
 func (p *Pool[T]) hijackAcquiredResource(res *Resource[T]) {
+	defer p.yieldToWaiter()
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
@@ -705,6 +713,17 @@ func (p *Pool[T]) hijackAcquiredResource(res *Resource[T]) {
 	p.allResources.remove(res)
 	res.status = resourceStatusHijacked
 	p.destructWG.Done() // not responsible for destructing hijacked resources
+}
+
+// yieldToWaiter hands this goroutine's P to the acquirer a release woke. The
+// runtime queues a goroutine woken by a channel close as runnext of the
+// waker's P, where it runs only once the waker blocks or another P steals it,
+// so without the yield a released resource sits unused until then. Must be
+// called with mux unlocked.
+func (p *Pool[T]) yieldToWaiter() {
+	if p.waiting.Load() > 0 {
+		runtime.Gosched()
+	}
 }
 
 func (p *Pool[T]) destructResourceValue(value T) {

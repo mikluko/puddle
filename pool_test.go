@@ -1510,3 +1510,44 @@ func BenchmarkAcquire_MultipleCancelledWithCPULoad(b *testing.B) {
 		r.NoError(err)
 	}
 }
+
+// BenchmarkAcquire_ReleaseThenWork saturates a pool of 4 with ~100 goroutines
+// that hold a resource for 1 ms and keep the CPU for 1 ms after releasing it.
+func BenchmarkAcquire_ReleaseThenWork(b *testing.B) {
+	const (
+		size  = 4
+		queue = 100
+		hold  = time.Millisecond
+		work  = time.Millisecond
+	)
+
+	r := require.New(b)
+	ctx := context.Background()
+	pool, err := puddle.NewPool(&puddle.Config[int32]{
+		MaxSize:     size,
+		Constructor: func(context.Context) (int32, error) { return 0, nil },
+		Destructor:  func(int32) {},
+	})
+	r.NoError(err)
+	defer pool.Close()
+	for i := 0; i < size; i++ {
+		r.NoError(pool.CreateResource(ctx))
+	}
+
+	procs := runtime.GOMAXPROCS(0)
+	b.SetParallelism((size + queue + procs - 1) / procs)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			res, err := pool.Acquire(ctx)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			time.Sleep(hold)
+			res.Release()
+			for t := time.Now(); time.Since(t) < work; {
+			}
+		}
+	})
+}
